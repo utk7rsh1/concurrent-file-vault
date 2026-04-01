@@ -1,0 +1,16 @@
+# compiled binaries
+vault_server
+vault_indexer
+vault_client
+
+# temporary and runtime logs
+*.txt
+*.log
+/tmp/vault_conflict_pipe
+
+# storage directory
+vault_storage/
+
+# assignment specific files we don't want in the clean repo
+BT2024119_p2p-file-vault_OS_MiniProject/
+BT2024119_p2p-file-vault_OS_MiniProject.zip
