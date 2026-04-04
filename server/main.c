@@ -7,11 +7,47 @@
 #include <netinet/in.h>
 #include "../common/protocol.h"
 
+static ssize_t recv_full(int fd, void *buf, size_t len) {
+    size_t received = 0;
+    while (received < len) {
+        ssize_t n = recv(fd, (char *)buf + received, len - received, 0);
+        if (n <= 0) return n == 0 ? (ssize_t)received : -1;
+        received += n;
+    }
+    return (ssize_t)received;
+}
+
+static void send_response(int fd, int status, const char *msg, long filesize, int version) {
+    Response res;
+    memset(&res, 0, sizeof(res));
+    res.status   = status;
+    res.filesize = filesize;
+    res.version  = version;
+    if (msg) strncpy(res.message, msg, sizeof(res.message) - 1);
+    send(fd, &res, sizeof(res), 0);
+}
+
 static void *client_handler(void *arg) {
     int fd = *(int *)arg;
     free(arg);
+
     printf("[SERVER] Thread handling client fd=%d\n", fd);
+    Request req;
+
+    while (1) {
+        ssize_t n = recv_full(fd, &req, sizeof(req));
+        if (n < (ssize_t)sizeof(req)) break;
+        if (req.type == CMD_QUIT) break;
+
+        if (req.type == CMD_AUTH) {
+            printf("[SERVER] Auth requested for %s\n", req.username);
+            send_response(fd, 0, "Auth details received (not checked yet)", 0, 0);
+        } else {
+            send_response(fd, -1, "Unknown or not implemented command", 0, 0);
+        }
+    }
     close(fd);
+    printf("[SERVER] Client disconnected\n");
     return NULL;
 }
 
