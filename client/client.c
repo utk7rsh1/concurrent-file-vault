@@ -2,24 +2,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "../common/protocol.h"
 
 static int sockfd = -1;
 
 static void cmd_auth(const char *username, const char *password) {
-    printf("[TODO] Authentication for %s:%s\n", username, password);
+    Request req;
+    memset(&req, 0, sizeof(req));
+    req.type = CMD_AUTH;
+    strncpy(req.username, username, 63);
+    strncpy(req.password, password, 63);
+    send(sockfd, &req, sizeof(req), 0);
+    printf("Sent auth request for %s\n", username);
 }
 
 static void cmd_push(const char *remote_name, const char *local_path, int base_version) {
-    printf("[TODO] Push %s from %s (base: %d)\n", remote_name, local_path, base_version);
+    printf("[TODO] Push %s\n", remote_name);
 }
 
 static void cmd_pull(const char *remote_name, int version, const char *save_path) {
-    printf("[TODO] Pull %s version %d to %s\n", remote_name, version, save_path ? save_path : "default");
+    printf("[TODO] Pull %s\n", remote_name);
 }
 
 static void cmd_list() {
-    printf("[TODO] List files\n");
+    printf("[TODO] List\n");
 }
 
 static void print_help() {
@@ -33,7 +42,24 @@ static void print_help() {
 }
 
 int main(int argc, char *argv[]) {
-    printf("Connected (Simulation Mode)\n");
+    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    int         port = argc > 2 ? atoi(argv[2]) : SERVER_PORT;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
+
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[ERR] Connection failed");
+        return 1;
+    }
+
+    printf("Connected to %s:%d\n", host, port);
     print_help();
 
     char line[1024];
@@ -71,5 +97,6 @@ int main(int argc, char *argv[]) {
             printf("[ERR] Unknown command. Type 'help' for usage.\n");
         }
     }
+    close(sockfd);
     return 0;
 }

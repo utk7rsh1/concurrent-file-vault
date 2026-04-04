@@ -2,9 +2,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "../common/protocol.h"
+
+static void *client_handler(void *arg) {
+    int fd = *(int *)arg;
+    free(arg);
+    printf("[SERVER] Thread handling client fd=%d\n", fd);
+    close(fd);
+    return NULL;
+}
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -22,7 +31,7 @@ int main() {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(server_fd, 5) < 0) {
+    if (listen(server_fd, MAX_CLIENTS) < 0) {
         perror("listen"); return 1;
     }
 
@@ -33,8 +42,12 @@ int main() {
         socklen_t cli_len = sizeof(cli_addr);
         int cli_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &cli_len);
         if (cli_fd < 0) continue;
-        printf("[SERVER] Client connected (fd=%d)\n", cli_fd);
-        close(cli_fd);
+
+        int *pfd = malloc(sizeof(int));
+        *pfd = cli_fd;
+        pthread_t tid;
+        pthread_create(&tid, NULL, client_handler, pfd);
+        pthread_detach(tid);
     }
     close(server_fd);
     return 0;
