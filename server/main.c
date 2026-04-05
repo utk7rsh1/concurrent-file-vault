@@ -5,7 +5,15 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "auth.h"
 #include "../common/protocol.h"
+
+typedef struct {
+    int  sockfd;
+    char username[64];
+    Role role;
+    int  authenticated;
+} ClientCtx;
 
 static ssize_t recv_full(int fd, void *buf, size_t len) {
     size_t received = 0;
@@ -27,31 +35,54 @@ static void send_response(int fd, int status, const char *msg, long filesize, in
     send(fd, &res, sizeof(res), 0);
 }
 
-static void *client_handler(void *arg) {
-    int fd = *(int *)arg;
-    free(arg);
+static void handle_auth(ClientCtx *ctx, Request *req) {
+    Role role;
+    if (auth_check(req->username, req->password, &role) < 0) {
+        send_response(ctx->sockfd, -1, "Authentication failed: invalid credentials", 0, 0);
+        return;
+    }
+    ctx->role          = role;
+    ctx->authenticated = 1;
+    strncpy(ctx->username, req->username, 63);
 
-    printf("[SERVER] Thread handling client fd=%d\n", fd);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Authenticated as '%s' with role: %s",
+             ctx->username, auth_role_name(ctx->role));
+    send_response(ctx->sockfd, 0, msg, 0, 0);
+}
+
+static void *client_handler(void *arg) {
+    ClientCtx *ctx = (ClientCtx *)arg;
+    printf("[SERVER] Client connected (fd=%d)\n", ctx->sockfd);
     Request req;
 
     while (1) {
-        ssize_t n = recv_full(fd, &req, sizeof(req));
+        ssize_t n = recv_full(ctx->sockfd, &req, sizeof(req));
         if (n < (ssize_t)sizeof(req)) break;
         if (req.type == CMD_QUIT) break;
 
         if (req.type == CMD_AUTH) {
-            printf("[SERVER] Auth requested for %s\n", req.username);
-            send_response(fd, 0, "Auth details received (not checked yet)", 0, 0);
-        } else {
-            send_response(fd, -1, "Unknown or not implemented command", 0, 0);
+            handle_auth(ctx, &req);
+            continue;
         }
+
+        if (!ctx->authenticated) {
+            send_response(ctx->sockfd, -1, "Not authenticated. Use: auth <user> <pass>", 0, 0);
+            continue;
+        }
+
+        send_response(ctx->sockfd, -1, "Command not implemented yet", 0, 0);
     }
-    close(fd);
+
     printf("[SERVER] Client disconnected\n");
+    close(ctx->sockfd);
+    free(ctx);
     return NULL;
 }
 
 int main() {
+    auth_init();
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
 
@@ -79,10 +110,10 @@ int main() {
         int cli_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &cli_len);
         if (cli_fd < 0) continue;
 
-        int *pfd = malloc(sizeof(int));
-        *pfd = cli_fd;
+        ClientCtx *ctx = calloc(1, sizeof(ClientCtx));
+        ctx->sockfd = cli_fd;
         pthread_t tid;
-        pthread_create(&tid, NULL, client_handler, pfd);
+        pthread_create(&tid, NULL, client_handler, ctx);
         pthread_detach(tid);
     }
     close(server_fd);
