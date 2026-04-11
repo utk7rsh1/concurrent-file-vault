@@ -13,6 +13,22 @@
 
 static pthread_rwlock_t vault_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
+static int apply_fcntl_lock(int fd, short type) {
+    struct flock fl;
+    fl.l_type   = type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = 0;
+    fl.l_len    = 0;
+    int ret;
+    if (type == F_UNLCK)
+        ret = fcntl(fd, F_SETLK, &fl);
+    else
+        ret = fcntl(fd, F_SETLKW, &fl);
+    if (ret < 0)
+        perror("[VAULT] fcntl lock");
+    return ret;
+}
+
 static ssize_t write_full(int fd, const void *buf, size_t count) {
     size_t written = 0;
     while (written < count) {
@@ -62,16 +78,25 @@ int vault_push(const char *filename, const char *data, long size,
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { pthread_rwlock_unlock(&vault_rwlock); return -1; }
 
+    if (apply_fcntl_lock(fd, F_WRLCK) < 0) {
+        close(fd);
+        pthread_rwlock_unlock(&vault_rwlock);
+        return -1;
+    }
+
     write_full(fd, data, size);
+    apply_fcntl_lock(fd, F_UNLCK);
     close(fd);
 
     char meta_path[600];
     snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", VAULT_DIR, filename);
     int mfd = open(meta_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (mfd >= 0) {
+        apply_fcntl_lock(mfd, F_WRLCK);
         char meta_line[256];
         int ml = snprintf(meta_line, sizeof(meta_line), "v%d|%s|%ld\n", next, username, (long)time(NULL));
         write_full(mfd, meta_line, ml);
+        apply_fcntl_lock(mfd, F_UNLCK);
         close(mfd);
     }
 
@@ -96,11 +121,18 @@ int vault_pull(const char *filename, int version,
     int fd = open(path, O_RDONLY);
     if (fd < 0) { pthread_rwlock_unlock(&vault_rwlock); return -1; }
 
+    if (apply_fcntl_lock(fd, F_RDLCK) < 0) {
+        close(fd);
+        pthread_rwlock_unlock(&vault_rwlock);
+        return -1;
+    }
+
     struct stat st;
     fstat(fd, &st);
     *size = st.st_size;
     *data = malloc(*size + 1);
     if (!*data) {
+        apply_fcntl_lock(fd, F_UNLCK);
         close(fd);
         pthread_rwlock_unlock(&vault_rwlock);
         return -1;
@@ -111,6 +143,7 @@ int vault_pull(const char *filename, int version,
     while (rd < *size && (n = read(fd, *data + rd, *size - rd)) > 0)
         rd += n;
 
+    apply_fcntl_lock(fd, F_UNLCK);
     close(fd);
     *actual_version = target;
     pthread_rwlock_unlock(&vault_rwlock);
