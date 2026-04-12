@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -56,17 +57,50 @@ int vault_get_latest_version(const char *filename) {
     return version;
 }
 
+static void run_diff(const char *path_a, const char *path_b, char *output, int max_len) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { output[0] = '\0'; return; }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execlp("diff", "diff", "-u", path_a, path_b, (char *)NULL);
+        _exit(1);
+    }
+
+    close(pipefd[1]);
+    int total = 0, n;
+    while (total < max_len - 1 &&
+           (n = read(pipefd[0], output + total, max_len - 1 - total)) > 0)
+        total += n;
+    output[total] = '\0';
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+}
+
 int vault_push(const char *filename, const char *data, long size,
                const char *username, int base_version,
                int *new_version, char *conflict_diff, int diff_buf_len) {
-    (void)conflict_diff;
-    (void)diff_buf_len;
 
     pthread_rwlock_wrlock(&vault_rwlock);
 
     int current = vault_get_latest_version(filename);
 
     if (base_version > 0 && current != base_version) {
+        char cur_path[600], tmp_path[600];
+        snprintf(cur_path, sizeof(cur_path), "%s/%s.v%d", VAULT_DIR, filename, current);
+        snprintf(tmp_path, sizeof(tmp_path), "/tmp/vault_incoming_%s_%d", filename, (int)getpid());
+
+        int tf = creat(tmp_path, 0644);
+        if (tf >= 0) { write_full(tf, data, size); close(tf); }
+
+        if (conflict_diff && diff_buf_len > 0)
+            run_diff(cur_path, tmp_path, conflict_diff, diff_buf_len);
+
+        unlink(tmp_path);
         pthread_rwlock_unlock(&vault_rwlock);
         return -2;
     }
@@ -84,7 +118,13 @@ int vault_push(const char *filename, const char *data, long size,
         return -1;
     }
 
-    write_full(fd, data, size);
+    long written = 0;
+    while (written < size) {
+        ssize_t w = write(fd, data + written, size - written);
+        if (w < 0) { perror("[VAULT] write data"); break; }
+        written += w;
+    }
+
     apply_fcntl_lock(fd, F_UNLCK);
     close(fd);
 
@@ -132,6 +172,7 @@ int vault_pull(const char *filename, int version,
     *size = st.st_size;
     *data = malloc(*size + 1);
     if (!*data) {
+        perror("[VAULT] malloc");
         apply_fcntl_lock(fd, F_UNLCK);
         close(fd);
         pthread_rwlock_unlock(&vault_rwlock);
@@ -145,6 +186,7 @@ int vault_pull(const char *filename, int version,
 
     apply_fcntl_lock(fd, F_UNLCK);
     close(fd);
+
     *actual_version = target;
     pthread_rwlock_unlock(&vault_rwlock);
     return 0;
@@ -164,12 +206,41 @@ int vault_list(char *output, int max_len) {
 
         char name[MAX_FILENAME];
         strncpy(name, entry->d_name, MAX_FILENAME - 1);
+        name[MAX_FILENAME - 1] = '\0';
         char *dot = strstr(name, ".meta");
         if (dot) *dot = '\0';
 
         int ver = vault_get_latest_version(name);
+
+        char meta_path[600];
+        snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", VAULT_DIR, name);
+
+        char last_entry[256] = "no history";
+        int mfd = open(meta_path, O_RDONLY);
+        if (mfd >= 0) {
+            apply_fcntl_lock(mfd, F_RDLCK);
+            char filebuf[4096];
+            ssize_t rb = read(mfd, filebuf, sizeof(filebuf) - 1);
+            apply_fcntl_lock(mfd, F_UNLCK);
+            close(mfd);
+            if (rb > 0) {
+                filebuf[rb] = '\0';
+                char *last_nl = strrchr(filebuf, '\n');
+                if (last_nl && last_nl != filebuf) {
+                    *last_nl = '\0';
+                    char *prev_nl = strrchr(filebuf, '\n');
+                    strncpy(last_entry, prev_nl ? prev_nl + 1 : filebuf, 255);
+                    last_entry[255] = '\0';
+                } else {
+                    strncpy(last_entry, filebuf, 255);
+                    last_entry[255] = '\0';
+                }
+                last_entry[strcspn(last_entry, "\n")] = '\0';
+            }
+        }
+
         written += snprintf(output + written, max_len - written,
-            "  %-30s  versions: %-3d\n", name, ver);
+            "  %-30s  versions: %-3d  last: %s\n", name, ver, last_entry);
         if (written >= max_len - 1) break;
     }
 
@@ -180,19 +251,23 @@ int vault_list(char *output, int max_len) {
 
 int vault_delete(const char *filename) {
     pthread_rwlock_wrlock(&vault_rwlock);
+
     int current = vault_get_latest_version(filename);
     if (current == 0) {
         pthread_rwlock_unlock(&vault_rwlock);
         return -1;
     }
+
     for (int v = 1; v <= current; v++) {
         char path[600];
         snprintf(path, sizeof(path), "%s/%s.v%d", VAULT_DIR, filename, v);
         unlink(path);
     }
+
     char meta_path[600];
     snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", VAULT_DIR, filename);
     unlink(meta_path);
+
     pthread_rwlock_unlock(&vault_rwlock);
     return 0;
 }
