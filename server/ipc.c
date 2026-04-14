@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <errno.h>
 
 static int              shmid    = -1;
 static int              msgid    = -1;
@@ -41,9 +42,11 @@ int ipc_send_index(const char *filename, int version, const char *username) {
     memset(&msg, 0, sizeof(msg));
     msg.mtype = 1;
     strncpy(msg.filename, filename, MAX_FILENAME - 1);
+    msg.filename[MAX_FILENAME - 1] = '\0';
     msg.version   = version;
     msg.timestamp = time(NULL);
     strncpy(msg.username, username, 63);
+    msg.username[63] = '\0';
     return msgsnd(msgid, &msg, sizeof(IndexMsg) - sizeof(long), 0);
 }
 
@@ -57,7 +60,8 @@ void ipc_notify_conflict(const char *filename, const char *username, const char 
 
     char buf[3200];
     int n = snprintf(buf, sizeof(buf), "CONFLICT|%s|%s|%.2048s", filename, username, diff ? diff : "");
-    write(fd, buf, n);
+    ssize_t w = write(fd, buf, n);
+    if (w < 0) perror("[IPC] FIFO write");
     close(fd);
 }
 
@@ -69,6 +73,20 @@ void ipc_shm_lock() {
 void ipc_shm_unlock() {
     if (shm_sem && shm_sem != SEM_FAILED)
         sem_post(shm_sem);
+}
+
+void ipc_remove_from_manifest(const char *filename) {
+    if (!manifest || manifest == (void *)-1) return;
+    ipc_shm_lock();
+    for (int i = 0; i < manifest->file_count; i++) {
+        if (strncmp(manifest->files[i].filename, filename, MAX_FILENAME) == 0) {
+            for (int j = i; j < manifest->file_count - 1; j++)
+                manifest->files[j] = manifest->files[j + 1];
+            manifest->file_count--;
+            break;
+        }
+    }
+    ipc_shm_unlock();
 }
 
 void ipc_cleanup() {

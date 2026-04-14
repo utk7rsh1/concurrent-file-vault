@@ -6,9 +6,12 @@
 #include <semaphore.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/select.h>
+#include <errno.h>
 #include "auth.h"
 #include "vault.h"
 #include "ipc.h"
@@ -56,6 +59,7 @@ static void handle_auth(ClientCtx *ctx, Request *req) {
     ctx->role          = role;
     ctx->authenticated = 1;
     strncpy(ctx->username, req->username, 63);
+    ctx->username[63] = '\0';
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Authenticated as '%s' with role: %s",
@@ -68,9 +72,20 @@ static void handle_push(ClientCtx *ctx, Request *req) {
         send_response(ctx->sockfd, -1, "Permission denied: your role cannot push files", 0, 0);
         return;
     }
+    if (req->filesize <= 0 || req->filesize > MAX_FILESIZE) {
+        send_response(ctx->sockfd, -1, "Invalid file size", 0, 0);
+        return;
+    }
+    if (req->filename[0] == '\0') {
+        send_response(ctx->sockfd, -1, "Filename cannot be empty", 0, 0);
+        return;
+    }
+
     send_response(ctx->sockfd, 0, "READY", 0, 0);
 
     char *data = malloc(req->filesize);
+    if (!data) { send_response(ctx->sockfd, -1, "Server out of memory", 0, 0); return; }
+
     long received = 0;
     while (received < req->filesize) {
         ssize_t n = recv(ctx->sockfd, data + received, req->filesize - received, 0);
@@ -123,6 +138,11 @@ static void handle_pull(ClientCtx *ctx, Request *req) {
 }
 
 static void handle_list(ClientCtx *ctx) {
+    if (!auth_has_permission(ctx->role, CMD_LIST)) {
+        send_response(ctx->sockfd, -1, "Permission denied", 0, 0);
+        return;
+    }
+
     char output[8192] = "=== Vault Contents ===\n";
     int  base         = strlen(output);
     int  n            = vault_list(output + base, sizeof(output) - base);
@@ -131,6 +151,11 @@ static void handle_list(ClientCtx *ctx) {
 }
 
 static void handle_status(ClientCtx *ctx) {
+    if (!auth_has_permission(ctx->role, CMD_STATUS)) {
+        send_response(ctx->sockfd, -1, "Permission denied: viewers cannot access status", 0, 0);
+        return;
+    }
+
     ipc_shm_lock();
     VersionManifest *m = ipc_get_manifest();
     char output[4096];
@@ -146,14 +171,64 @@ static void handle_status(ClientCtx *ctx) {
                         clients, m ? m->file_count : 0);
 
     if (m) {
-        for (int i = 0; i < m->file_count; i++) {
+        for (int i = 0; i < m->file_count && written < (int)sizeof(output) - 128; i++) {
+            char timebuf[32] = "unknown";
+            if (m->files[i].last_modified) {
+                struct tm *tm_info = localtime(&m->files[i].last_modified);
+                strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+            }
             written += snprintf(output + written, sizeof(output) - written,
-                "  %-30s  v%-3d  by: %-15s\n",
+                "  %-30s  v%-3d  by: %-15s  at: %s\n",
                 m->files[i].filename, m->files[i].latest_version,
-                m->files[i].last_user);
+                m->files[i].last_user, timebuf);
         }
     }
     ipc_shm_unlock();
+
+    send_response(ctx->sockfd, 0, output, 0, 0);
+}
+
+static void handle_delete(ClientCtx *ctx, Request *req) {
+    if (!auth_has_permission(ctx->role, CMD_DELETE)) {
+        send_response(ctx->sockfd, -1, "Permission denied: only owner can delete files", 0, 0);
+        return;
+    }
+    if (req->filename[0] == '\0') {
+        send_response(ctx->sockfd, -1, "Filename cannot be empty", 0, 0);
+        return;
+    }
+
+    if (vault_delete(req->filename) == 0) {
+        ipc_remove_from_manifest(req->filename);
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Deleted '%s' and all its versions", req->filename);
+        send_response(ctx->sockfd, 0, msg, 0, 0);
+        printf("[SERVER] File '%s' deleted by owner '%s'\n", req->filename, ctx->username);
+    } else {
+        send_response(ctx->sockfd, -1, "File not found in vault", 0, 0);
+    }
+}
+
+static void handle_logs(ClientCtx *ctx) {
+    if (!auth_has_permission(ctx->role, CMD_LOGS)) {
+        send_response(ctx->sockfd, -1, "Permission denied: only owner can view logs", 0, 0);
+        return;
+    }
+
+    int fd = open("conflict.log", O_RDONLY);
+    if (fd < 0) {
+        send_response(ctx->sockfd, 0, "=== Conflict Log ===\n  (no conflicts recorded)\n", 0, 0);
+        return;
+    }
+
+    char output[4096] = "=== Conflict Log ===\n";
+    int base = strlen(output);
+    ssize_t n = read(fd, output + base, sizeof(output) - base - 1);
+    close(fd);
+
+    if (n > 0) output[base + n] = '\0';
+    else strcat(output, "  (empty)\n");
+
     send_response(ctx->sockfd, 0, output, 0, 0);
 }
 
@@ -161,10 +236,14 @@ static void *client_handler(void *arg) {
     ClientCtx *ctx = (ClientCtx *)arg;
     Request    req;
 
+    printf("[SERVER] Client connected (fd=%d)\n", ctx->sockfd);
+
     while (running) {
         ssize_t n = recv_full(ctx->sockfd, &req, sizeof(req));
         if (n < (ssize_t)sizeof(req)) break;
+
         if (req.type == CMD_QUIT) break;
+
         if (req.type == CMD_AUTH) { handle_auth(ctx, &req); continue; }
 
         if (!ctx->authenticated) {
@@ -177,10 +256,14 @@ static void *client_handler(void *arg) {
             case CMD_PULL:   handle_pull(ctx, &req);   break;
             case CMD_LIST:   handle_list(ctx);          break;
             case CMD_STATUS: handle_status(ctx);        break;
+            case CMD_DELETE: handle_delete(ctx, &req);  break;
+            case CMD_LOGS:   handle_logs(ctx);          break;
             default:         send_response(ctx->sockfd, -1, "Unknown command", 0, 0);
         }
     }
 
+    printf("[SERVER] Client disconnected (fd=%d, user=%s)\n",
+           ctx->sockfd, ctx->authenticated ? ctx->username : "unauthenticated");
     close(ctx->sockfd);
     sem_post(&conn_sem);
 
@@ -192,12 +275,76 @@ static void *client_handler(void *arg) {
     return NULL;
 }
 
+static void *fifo_monitor(void *arg) {
+    (void)arg;
+    char buf[3300];
+    fd_set  readfds;
+    struct timeval tv;
+
+    while (running) {
+        int fd = open(FIFO_PATH, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) { sleep(1); continue; }
+
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        tv.tv_sec  = 10;
+        tv.tv_usec = 0;
+
+        int ready = select(fd + 1, &readfds, NULL, NULL, &tv);
+        if (ready <= 0) { close(fd); continue; }
+
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("[CONFLICT LOG] %s\n", buf);
+            int log_fd = open("conflict.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (log_fd >= 0) {
+                time_t now = time(NULL);
+                char timebuf[32];
+                struct tm *tm_info = localtime(&now);
+                strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+                char logbuf[3400];
+                int lb = snprintf(logbuf, sizeof(logbuf), "[%s] %s\n", timebuf, buf);
+                ssize_t w = write(log_fd, logbuf, lb);
+                if (w < 0) perror("[SERVER] conflict log write");
+                close(log_fd);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void signal_handler(int sig) {
+    (void)sig;
+    running = 0;
+    printf("\n[SERVER] Shutting down...\n");
+}
+
 int main() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
+
     auth_init();
-    vault_init();
-    ipc_init();
+    if (vault_init() < 0) { perror("vault_init"); return 1; }
+    if (ipc_init()   < 0) { perror("ipc_init");   return 1; }
 
     sem_init(&conn_sem, 0, MAX_CLIENTS);
+
+    pthread_t fifo_tid;
+    if (pthread_create(&fifo_tid, NULL, fifo_monitor, NULL) != 0) {
+        perror("pthread_create fifo_monitor");
+        return 1;
+    }
+    pthread_detach(fifo_tid);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
@@ -219,6 +366,7 @@ int main() {
     }
 
     printf("[SERVER] P2P File Vault running on port %d\n", SERVER_PORT);
+    printf("[SERVER] Max concurrent clients: %d\n\n", MAX_CLIENTS);
 
     while (running) {
         struct sockaddr_in cli_addr;
@@ -226,18 +374,46 @@ int main() {
         int cli_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &cli_len);
         if (cli_fd < 0) continue;
 
-        sem_wait(&conn_sem);
+        if (sem_trywait(&conn_sem) != 0) {
+            send_response(cli_fd, -1, "Server full, try again later", 0, 0);
+            close(cli_fd);
+            continue;
+        }
+
+        struct timeval tv;
+        tv.tv_sec  = 120;
+        tv.tv_usec = 0;
+        setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         pthread_mutex_lock(&stats_mutex);
         active_clients++;
         pthread_mutex_unlock(&stats_mutex);
 
         ClientCtx *ctx = calloc(1, sizeof(ClientCtx));
+        if (!ctx) {
+            close(cli_fd);
+            sem_post(&conn_sem);
+            pthread_mutex_lock(&stats_mutex);
+            active_clients--;
+            pthread_mutex_unlock(&stats_mutex);
+            continue;
+        }
         ctx->sockfd = cli_fd;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, client_handler, ctx);
-        pthread_detach(tid);
+        pthread_attr_t tattr;
+        pthread_attr_init(&tattr);
+        pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid, &tattr, client_handler, ctx) != 0) {
+            perror("pthread_create client_handler");
+            close(cli_fd);
+            sem_post(&conn_sem);
+            pthread_mutex_lock(&stats_mutex);
+            active_clients--;
+            pthread_mutex_unlock(&stats_mutex);
+            free(ctx);
+        }
+        pthread_attr_destroy(&tattr);
     }
 
     close(server_fd);

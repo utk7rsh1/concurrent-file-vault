@@ -20,7 +20,9 @@ typedef enum {
     CMD_PULL,
     CMD_LIST,
     CMD_STATUS,
-    CMD_QUIT
+    CMD_QUIT,
+    CMD_DELETE,
+    CMD_LOGS
 } CmdType;
 
 typedef struct {
