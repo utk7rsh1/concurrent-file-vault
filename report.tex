@@ -1,0 +1,322 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{setspace}
+\usepackage{parskip}
+
+% Better spacing
+\setstretch{1.25}
+\setlength{\parskip}{0.6em}
+
+\title{\textbf{P2P File Vault with Version Control} \\[0.3cm]
+       \large EGC 301P -- Operating Systems Lab Mini Project}
+\author{Name: \textit{Utkarsh Rastogi}}\n
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{Problem Statement}
+% ============================================================
+
+Design a distributed file vault where multiple clients can push, pull, and manage
+versioned files through a central server, while a separate indexer process maintains
+a live manifest. The system must enforce role-based access control, protect files
+under concurrent access using locking, communicate across processes via IPC, and
+detect version conflicts---all using OS-level primitives and system calls.
+
+% ============================================================
+\section{Implementation of Required Concepts}
+% ============================================================
+
+The system has three processes: \texttt{vault\_server} (TCP server with per-client
+threads), \texttt{vault\_indexer} (daemon consuming a message queue), and
+\texttt{vault\_client} (interactive CLI). All source files are modular:
+\texttt{auth.c}, \texttt{vault.c}, \texttt{ipc.c}, \texttt{main.c},
+\texttt{indexer.c}, \texttt{client.c}, with shared types in \texttt{protocol.h}.
+
+% -------------------------------------------------------
+\subsection{Role-Based Authorization}
+
+Three roles are defined as an enum in \texttt{protocol.h}:
+\texttt{OWNER=0}, \texttt{CONTRIBUTOR=1}, \texttt{VIEWER=2}. Five user accounts
+are hard-coded in \texttt{auth.c} (alice/owner, bob \& charlie/contributor,
+guest1 \& guest2/viewer). Authentication works as follows:
+
+\begin{enumerate}[itemsep=0.3em]
+    \item The client sends a \texttt{CMD\_AUTH} request containing a username and password.
+    \item The server calls \texttt{auth\_check()}, which iterates the user table and
+          compares credentials using \texttt{strcmp()}. On match, the user's role is
+          stored in the per-client context (\texttt{ClientCtx}).
+    \item On every subsequent command, the server calls
+          \texttt{auth\_has\_permission(role, cmd)} at the \textbf{entry} of the handler.
+          If denied, a ``Permission denied'' response is sent immediately.
+\end{enumerate}
+
+The permission matrix enforces a strict hierarchy---commands like
+\texttt{auth}, \texttt{quit}, \texttt{list}, and \texttt{pull} are open to all
+roles. \texttt{push} and \texttt{status} require at least contributor privileges.
+Administrative commands \texttt{delete} and \texttt{logs} are restricted to the
+owner only. This ensures that viewers cannot modify files, contributors cannot
+perform administrative actions, and unauthenticated clients are blocked from all
+commands except \texttt{auth} itself.
+
+% -------------------------------------------------------
+\subsection{File Locking}
+
+A \textbf{two-layer locking strategy} is required because no single mechanism
+covers both multi-threaded and multi-process scenarios:
+
+\begin{enumerate}[itemsep=0.3em]
+    \item \textbf{Layer~1 -- \texttt{pthread\_rwlock\_t}} (thread-level): A global
+          read-write lock in \texttt{vault.c} serializes access among the server's
+          client-handler threads. \texttt{vault\_push()} and \texttt{vault\_delete()}
+          acquire the write lock; \texttt{vault\_pull()} and \texttt{vault\_list()}
+          acquire the read lock. Multiple readers can proceed concurrently, but a
+          writer gets exclusive access.
+
+    \item \textbf{Layer~2 -- \texttt{fcntl} advisory locks} (process-level): On
+          every \texttt{open()}'ed file descriptor, the code acquires \texttt{F\_WRLCK}
+          or \texttt{F\_RDLCK} via \texttt{fcntl(fd, F\_SETLKW, \&fl)}. This protects
+          against external processes (e.g., backup scripts) touching
+          \texttt{vault\_storage/} directly.
+\end{enumerate}
+
+A centralized helper function, \texttt{apply\_fcntl\_lock(fd, type)}, handles both
+lock acquisition (blocking with \texttt{F\_SETLKW}) and release (non-blocking with
+\texttt{F\_SETLK}). Lock usage is consistent across all operations:
+\texttt{vault\_push()} acquires \texttt{F\_WRLCK} on the version file \emph{and}
+the \texttt{.meta} file; \texttt{vault\_pull()} acquires \texttt{F\_RDLCK} on the
+version file; \texttt{vault\_list()} acquires \texttt{F\_RDLCK} on each
+\texttt{.meta} file.
+
+% -------------------------------------------------------
+\subsection{Concurrency Control}
+
+Four distinct synchronization primitives are employed, each addressing a different
+concurrency concern:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Primitive} & \textbf{Purpose} & \textbf{File} \\
+\midrule
+\texttt{pthread\_rwlock\_t}       & Vault read/write serialization  & vault.c \\[0.2em]
+\texttt{sem\_t} (unnamed)         & Connection cap (max 20 clients) & main.c \\[0.2em]
+\texttt{sem\_t} (named, POSIX)    & Shared memory protection        & ipc.c \\[0.2em]
+\texttt{pthread\_mutex\_t}        & Active client counter           & main.c \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Connection throttling:} An unnamed semaphore is initialized to
+\texttt{MAX\_CLIENTS = 20} via \texttt{sem\_init()}. When a client connects, the
+server calls \texttt{sem\_trywait()}: if the semaphore is already zero (server full),
+the client receives a ``Server full'' message and is disconnected immediately.
+When a client disconnects, \texttt{sem\_post()} releases the slot.
+
+\textbf{Mutex-protected counter:} The \texttt{active\_clients} integer is
+incremented in the accept loop and decremented in the client handler thread.
+Both operations are wrapped in \texttt{pthread\_mutex\_lock/unlock} to prevent
+data races. The counter is displayed via the \texttt{status} command.
+
+\textbf{Named semaphore:} The shared memory manifest (written by the indexer,
+read by the server's \texttt{status} handler) is protected by a POSIX named
+semaphore (\texttt{/vault\_shm\_sem}) created with \texttt{sem\_open()} and
+accessed via \texttt{sem\_wait()/sem\_post()}.
+
+% -------------------------------------------------------
+\subsection{Data Consistency}
+
+Three mechanisms work together to ensure data consistency:
+
+\begin{enumerate}[itemsep=0.3em]
+    \item \textbf{Two-layer locking} (described in \S2.2) prevents race conditions,
+          dirty reads, and lost updates at both thread and process levels.
+
+    \item \textbf{Optimistic versioning:} Each \texttt{push} command carries a
+          \texttt{base\_version} parameter. Inside \texttt{vault\_push()}, if
+          \texttt{base\_version > 0} and the server's current version differs, the
+          push is rejected with return code \texttt{-2} (conflict). This detects
+          the scenario where two contributors edit the same base version concurrently.
+
+    \item \textbf{Conflict diff generation:} When a conflict is detected, the server
+          writes the incoming data to a temporary file (\texttt{creat()}), forks a
+          child process that executes \texttt{diff~-u} via \texttt{execlp()}, and
+          captures the unified diff output through an unnamed pipe (\texttt{pipe()} +
+          \texttt{dup2()}) in the parent. The diff is sent back to the client and
+          also written to the FIFO for logging.
+\end{enumerate}
+
+The \texttt{run\_diff()} function demonstrates \texttt{pipe()}, \texttt{fork()},
+\texttt{dup2()} (redirecting stdout to the pipe's write end), \texttt{execlp()}
+(to execute the \texttt{diff} command), \texttt{read()} (to collect output in the
+parent), and \texttt{waitpid()} (to reap the child process).
+
+% -------------------------------------------------------
+\subsection{Socket Programming}
+
+The system uses TCP (\texttt{AF\_INET, SOCK\_STREAM}) sockets in a client-server
+architecture with the following design:
+
+\textbf{Server side} (\texttt{main.c}):
+\begin{itemize}[itemsep=0.3em]
+    \item Creates a socket with \texttt{socket(AF\_INET, SOCK\_STREAM, 0)}.
+    \item Sets \texttt{SO\_REUSEADDR} via \texttt{setsockopt()} to allow quick restarts.
+    \item Binds to port 8080 via \texttt{bind()} and begins listening with
+          \texttt{listen(server\_fd, MAX\_CLIENTS)}.
+    \item Accepts connections in a loop via \texttt{accept()}, which returns a new
+          file descriptor for each client.
+    \item Each client is handled by a detached thread created with
+          \texttt{pthread\_create()} and \texttt{PTHREAD\_CREATE\_DETACHED}, so
+          resources are automatically freed on thread exit.
+    \item Sets \texttt{SO\_RCVTIMEO} (120 seconds) on each client socket to prevent
+          threads from hanging indefinitely on disconnected clients.
+\end{itemize}
+
+\textbf{Client side} (\texttt{client.c}):
+\begin{itemize}[itemsep=0.3em]
+    \item Parses the server address with \texttt{inet\_pton()} and connects using
+          \texttt{connect()}.
+    \item Uses a \texttt{recv\_full()} helper that loops until exactly
+          \texttt{sizeof(Response)} bytes are received, correctly handling TCP stream
+          fragmentation where a single \texttt{recv()} may return partial data.
+\end{itemize}
+
+\textbf{Wire protocol:} Fixed-size \texttt{Request} and \texttt{Response} structs
+(defined in \texttt{protocol.h}) are exchanged as binary messages. For file transfers,
+a two-phase handshake is used: the server sends a READY response, then the client
+streams the raw file bytes, followed by a final status response.
+
+% -------------------------------------------------------
+\subsection{Inter-Process Communication}
+
+All four major IPC mechanisms are used, each serving a distinct role:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Mechanism} & \textbf{Direction} & \textbf{Purpose} & \textbf{Key Calls} \\
+\midrule
+Message Queue  & Server $\to$ Indexer & Push notifications & msgget, msgsnd, msgrcv \\[0.2em]
+Shared Memory  & Server $\leftrightarrow$ Indexer & Live manifest & shmget, shmat, shmdt \\[0.2em]
+Named Pipe     & Server $\to$ Monitor & Conflict alerts   & mkfifo, select, read \\[0.2em]
+Unnamed Pipe   & Parent $\to$ Child   & Diff output       & pipe, fork, dup2, execlp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Message Queue:} When a file is pushed successfully, the server constructs
+an \texttt{IndexMsg} struct (filename, version, username, timestamp) and sends it
+via \texttt{msgsnd()} to a System~V message queue created with \texttt{msgget()}.
+The indexer process blocks on \texttt{msgrcv()} waiting for messages with
+\texttt{mtype = 1} and processes them in order. On shutdown, the queue is cleaned
+up with \texttt{msgctl(msgid, IPC\_RMID, NULL)}.
+
+\textbf{Shared Memory:} A \texttt{VersionManifest} struct (containing up to 100
+\texttt{FileEntry} records with filename, latest version, last modified time, and
+last user) is stored in a System~V shared memory segment created with
+\texttt{shmget()} and attached with \texttt{shmat()}. The indexer writes to it
+upon receiving messages; the server reads from it for the \texttt{status} command.
+Access is protected by a POSIX named semaphore. On file deletion, the server calls
+\texttt{ipc\_remove\_from\_manifest()} which acquires the semaphore, shifts the
+array to fill the gap, and decrements the count.
+
+\textbf{Named Pipe (FIFO):} Created with \texttt{mkfifo()} at
+\texttt{/tmp/vault\_conflict\_pipe}. When a conflict is detected, the server writes
+a formatted conflict message via \texttt{write()} with \texttt{O\_NONBLOCK} (so it
+doesn't stall if no reader is connected). A dedicated monitor thread opens the FIFO
+with \texttt{O\_RDONLY | O\_NONBLOCK}, uses \texttt{select()} with a 10-second
+timeout to wait for data without busy-waiting, and logs conflict events to
+\texttt{conflict.log} using \texttt{open(O\_APPEND)} and \texttt{write()}.
+
+\textbf{Unnamed Pipe:} The \texttt{run\_diff()} function creates a pipe with
+\texttt{pipe()}, forks a child with \texttt{fork()}, redirects the child's stdout
+to the pipe's write end with \texttt{dup2()}, and executes \texttt{diff -u} with
+\texttt{execlp()}. The parent reads the diff output from the pipe's read end and
+reaps the child with \texttt{waitpid()}.
+
+% ============================================================
+\section{Screenshots / Output}
+% ============================================================
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 222741.png}
+\caption{Successful build with \texttt{make} -- clean compilation with no warnings.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 223028.png}\\[0.4cm]
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 223056.png}\\[0.4cm]
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 223107.png}
+\caption{System startup: server, indexer, and client running in separate terminals.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 223533.png}
+\caption{Role-based authorization: viewer denied push access.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 224048.png}
+\caption{Push, list, and pull demonstrating versioned file storage.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 224625.png}\\[0.4cm]
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 224633.png}
+\caption{Conflict detection: two clients pushing the same file, second gets CONFLICT with diff.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 225032.png}\\[0.4cm]
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 225039.png}
+\caption{Message queue and shared memory IPC: indexer receiving push notifications and \texttt{status} output.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{screenshots/Screenshot 2026-04-30 225342.png}
+\caption{Owner-exclusive file deletion with \texttt{list} confirming removal.}
+\end{figure}
+
+% ============================================================
+\section{Challenges Faced and Solutions}
+% ============================================================
+
+\begin{enumerate}[itemsep=0.5em]
+    \item \textbf{TCP fragmentation:} \texttt{recv()} may return partial data.
+          Solved with a \texttt{recv\_full()} loop that reads until the exact struct
+          size is received.
+
+    \item \textbf{Thread vs.\ process locking:} \texttt{pthread\_rwlock} is invisible
+          across processes; \texttt{fcntl} locks are invisible across threads.
+          Solved by using both on every file access path.
+
+    \item \textbf{FIFO blocking:} Opening a FIFO for reading blocks until a writer
+          exists. Solved with \texttt{O\_NONBLOCK} + \texttt{select()} with a
+          10-second timeout.
+
+    \item \textbf{Stale SHM entries:} Deleting a file left ghost entries in the
+          shared memory manifest. Solved with \texttt{ipc\_remove\_from\_manifest()}
+          that shifts the array under semaphore protection.
+
+    \item \textbf{Conflict diff capture:} Needed to run \texttt{diff} and capture
+          its output within the server. Solved by forking a child process, redirecting
+          stdout to an unnamed pipe via \texttt{dup2()}, and reading the pipe in the
+          parent.
+\end{enumerate}
+
+\end{document}
